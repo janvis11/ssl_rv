@@ -1,78 +1,120 @@
-"""
-Fine-tune a linear classifier on a small labeled dataset.
-
-Supports two modes:
-  1. Pretrained — loads SimCLR encoder weights, optionally freezes encoder
-  2. Scratch   — trains a fresh ResNet-18 from random initialization
-
-Usage:
-    # Fine-tune with pretrained SimCLR encoder
-    python -m src.finetune --csv_path data/labeled/labels.csv \
-        --pretrained_path outputs/checkpoints/simclr_encoder_final.pt --epochs 30
-
-    # Train from scratch (baseline)
-    python -m src.finetune --csv_path data/labeled/labels.csv --from_scratch --epochs 30
-"""
-
 import argparse
 import json
-import os
-import time
+import random
+from pathlib import Path
+from typing import Dict, Tuple
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Subset
+from sklearn.metrics import accuracy_score, f1_score
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from src.augmentations import get_eval_transform, get_train_transform
-from src.datasets import LabeledImageDataset, get_label_mapping_from_csv, get_num_classes_from_csv
-from src.model import LinearClassifier, ResNet18Encoder
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fine-tune / train-from-scratch classifier")
-    parser.add_argument("--csv_path", type=str, required=True,
-                        help="Path to labeled CSV (image_path,label)")
-    parser.add_argument("--pretrained_path", type=str, default=None,
-                        help="Path to pretrained SimCLR encoder state-dict")
-    parser.add_argument("--from_scratch", action="store_true",
-                        help="Train a fresh ResNet-18 from scratch (baseline)")
-    parser.add_argument("--freeze_encoder", action="store_true",
-                        help="Freeze encoder weights during fine-tuning (linear probe)")
-    parser.add_argument("--epochs", type=int, default=30,
-                        help="Number of fine-tuning epochs")
-    parser.add_argument("--batch_size", type=int, default=16,
-                        help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                        help="Learning rate")
-    parser.add_argument("--val_split", type=float, default=0.2,
-                        help="Fraction of data for validation")
-    parser.add_argument("--image_size", type=int, default=224,
-                        help="Image resize dimension")
-    parser.add_argument("--num_workers", type=int, default=2,
-                        help="DataLoader workers")
-    parser.add_argument("--checkpoint_dir", type=str, default="outputs/checkpoints",
-                        help="Directory to save best model")
-    parser.add_argument("--plots_dir", type=str, default="outputs/plots",
-                        help="Directory to save training curves")
-    parser.add_argument("--metrics_dir", type=str, default="outputs/metrics",
-                        help="Directory to save metrics JSON")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for reproducibility")
-    return parser.parse_args()
+from augmentations import get_eval_transform, get_train_transform
+from datasets import LabeledImageDataset, get_label_mapping_from_csv
+from model import LinearClassifier, ResNet18Encoder
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device):
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def save_json(data: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def build_loaders(
+    train_csv: str,
+    val_csv: str,
+    test_csv: str,
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, int]]:
+    label_to_index = get_label_mapping_from_csv(train_csv)
+
+    train_dataset = LabeledImageDataset(
+        csv_path=train_csv,
+        transform=get_train_transform(image_size),
+        label_to_index=label_to_index,
+    )
+    val_dataset = LabeledImageDataset(
+        csv_path=val_csv,
+        transform=get_eval_transform(image_size),
+        label_to_index=label_to_index,
+    )
+    test_dataset = LabeledImageDataset(
+        csv_path=test_csv,
+        transform=get_eval_transform(image_size),
+        label_to_index=label_to_index,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    return train_loader, val_loader, test_loader, label_to_index
+
+
+def load_encoder_from_pretrained(checkpoint_path: str, device: torch.device) -> ResNet18Encoder:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    encoder = ResNet18Encoder(pretrained=False)
+
+    if isinstance(checkpoint, dict) and "encoder_state_dict" in checkpoint:
+        encoder.load_state_dict(checkpoint["encoder_state_dict"])
+    elif isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        raise ValueError(
+            "Checkpoint contains full model_state_dict but no encoder_state_dict. "
+            "Use a SimCLR checkpoint saved by the updated training script."
+        )
+    else:
+        encoder.load_state_dict(checkpoint)
+
+    return encoder
+
+
+def train_one_epoch(
+    model: LinearClassifier,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> Tuple[float, float, float]:
     model.train()
-    total_loss = 0.0
-    correct = 0
-    total = 0
+    running_loss = 0.0
+    all_preds = []
+    all_targets = []
 
-    for images, labels in dataloader:
-        images, labels = images.to(device), labels.to(device)
+    progress = tqdm(loader, desc="Fine-tuning", leave=False)
+    for images, labels in progress:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         logits = model(images)
         loss = criterion(logits, labels)
@@ -81,189 +123,203 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * images.size(0)
-        preds = logits.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += images.size(0)
+        preds = torch.argmax(logits, dim=1)
+        all_preds.extend(preds.detach().cpu().numpy())
+        all_targets.extend(labels.detach().cpu().numpy())
+        running_loss += loss.item()
 
-    avg_loss = total_loss / max(total, 1)
-    accuracy = correct / max(total, 1)
-    return avg_loss, accuracy
+        progress.set_postfix(loss=f"{loss.item():.4f}")
+
+    avg_loss = running_loss / max(len(loader), 1)
+    acc = accuracy_score(all_targets, all_preds)
+    macro_f1 = f1_score(all_targets, all_preds, average="macro")
+    return avg_loss, acc, macro_f1
 
 
-@torch.no_grad()
-def evaluate(model, dataloader, criterion, device):
+def evaluate(
+    model: LinearClassifier,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> Tuple[float, float, float]:
     model.eval()
-    total_loss = 0.0
-    correct = 0
-    total = 0
+    running_loss = 0.0
+    all_preds = []
+    all_targets = []
 
-    for images, labels in dataloader:
-        images, labels = images.to(device), labels.to(device)
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-        logits = model(images)
-        loss = criterion(logits, labels)
+            logits = model(images)
+            loss = criterion(logits, labels)
 
-        total_loss += loss.item() * images.size(0)
-        preds = logits.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += images.size(0)
+            preds = torch.argmax(logits, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(labels.cpu().numpy())
+            running_loss += loss.item()
 
-    avg_loss = total_loss / max(total, 1)
-    accuracy = correct / max(total, 1)
-    return avg_loss, accuracy
+    avg_loss = running_loss / max(len(loader), 1)
+    acc = accuracy_score(all_targets, all_preds)
+    macro_f1 = f1_score(all_targets, all_preds, average="macro")
+    return avg_loss, acc, macro_f1
 
 
-def save_training_curves(history: dict, save_path: str, title_prefix: str) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Loss
-    axes[0].plot(history["train_loss"], label="Train", linewidth=2, color="#2563eb")
-    axes[0].plot(history["val_loss"], label="Val", linewidth=2, color="#dc2626")
-    axes[0].set_xlabel("Epoch", fontsize=11)
-    axes[0].set_ylabel("Loss", fontsize=11)
-    axes[0].set_title(f"{title_prefix} — Loss", fontsize=13)
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    # Accuracy
-    axes[1].plot(history["train_acc"], label="Train", linewidth=2, color="#2563eb")
-    axes[1].plot(history["val_acc"], label="Val", linewidth=2, color="#dc2626")
-    axes[1].set_xlabel("Epoch", fontsize=11)
-    axes[1].set_ylabel("Accuracy", fontsize=11)
-    axes[1].set_title(f"{title_prefix} — Accuracy", fontsize=13)
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-    print(f"Training curves saved: {save_path}")
+def save_classifier_checkpoint(
+    path: Path,
+    epoch: int,
+    model: LinearClassifier,
+    optimizer: torch.optim.Optimizer,
+    label_to_index: Dict[str, int],
+    metrics: dict,
+    args: argparse.Namespace,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "encoder_state_dict": model.encoder.state_dict(),
+            "classifier_state_dict": model.classifier.state_dict(),
+            "label_to_index": label_to_index,
+            "metrics": metrics,
+            "args": vars(args),
+        },
+        path,
+    )
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Fine-tune classifier on labeled KITTI frames")
+    parser.add_argument("--train_csv", type=str, default="data/labeled/train.csv")
+    parser.add_argument("--val_csv", type=str, default="data/labeled/val.csv")
+    parser.add_argument("--test_csv", type=str, default="data/labeled/test.csv")
+    parser.add_argument("--output_dir", type=str, default="outputs")
+    parser.add_argument("--pretrained_ckpt", type=str, default="outputs/checkpoints/simclr_full_best.pt")
+    parser.add_argument("--use_pretrained", action="store_true")
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--image_size", type=int, default=224)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
 
-    # ── Reproducibility ───────────────────────────────────────────
-    torch.manual_seed(args.seed)
-
+    set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    os.makedirs(args.plots_dir, exist_ok=True)
-    os.makedirs(args.metrics_dir, exist_ok=True)
-
-    # ── Determine mode ────────────────────────────────────────────
-    mode = "scratch" if args.from_scratch else "pretrained"
-    print(f"Mode: {mode}")
-
-    # ── Dataset ───────────────────────────────────────────────────
-    num_classes = get_num_classes_from_csv(args.csv_path)
-    label_mapping = get_label_mapping_from_csv(args.csv_path)
-    print(f"Classes ({num_classes}): {list(label_mapping.keys())}")
-
-    train_transform = get_train_transform(args.image_size)
-    eval_transform = get_eval_transform(args.image_size)
-
-    full_dataset = LabeledImageDataset(
-        csv_path=args.csv_path, transform=train_transform, label_to_index=label_mapping
+    train_loader, val_loader, test_loader, label_to_index = build_loaders(
+        args.train_csv,
+        args.val_csv,
+        args.test_csv,
+        args.image_size,
+        args.batch_size,
+        args.num_workers,
     )
 
-    # Train / val split
-    indices = list(range(len(full_dataset)))
-    train_idx, val_idx = train_test_split(
-        indices, test_size=args.val_split, random_state=args.seed
-    )
-    train_subset = Subset(full_dataset, train_idx)
-
-    # Validation uses eval transforms — wrap with a separate dataset instance
-    val_dataset = LabeledImageDataset(
-        csv_path=args.csv_path, transform=eval_transform, label_to_index=label_mapping
-    )
-    val_subset = Subset(val_dataset, val_idx)
-
-    train_loader = DataLoader(
-        train_subset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_subset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
-    )
-    print(f"Train: {len(train_idx)} samples | Val: {len(val_idx)} samples")
-
-    # ── Build model ───────────────────────────────────────────────
-    encoder = ResNet18Encoder(pretrained=False)
-
-    if mode == "pretrained" and args.pretrained_path:
-        state_dict = torch.load(args.pretrained_path, map_location=device, weights_only=True)
-        encoder.load_state_dict(state_dict)
-        print(f"Loaded pretrained encoder from {args.pretrained_path}")
+    if args.use_pretrained:
+        encoder = load_encoder_from_pretrained(args.pretrained_ckpt, device)
+        run_name = "pretrained"
     else:
-        print("Training encoder from scratch (random init)")
+        encoder = ResNet18Encoder(pretrained=False)
+        run_name = "scratch"
 
-    if args.freeze_encoder:
-        for param in encoder.parameters():
-            param.requires_grad = False
-        print("Encoder weights FROZEN (linear probe)")
-
-    model = LinearClassifier(encoder=encoder, num_classes=num_classes).to(device)
+    model = LinearClassifier(encoder=encoder, num_classes=len(label_to_index)).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr
-    )
+    optimizer = AdamW(model.parameters(), lr=args.lr)
 
-    # ── Training loop ─────────────────────────────────────────────
-    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
-    best_val_acc = 0.0
-    start_time = time.time()
+    checkpoint_dir = Path(args.output_dir) / "checkpoints"
+    metrics_dir = Path(args.output_dir) / "metrics"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+
+    history = {"train": [], "val": []}
+    best_val_f1 = -1.0
+
+    print(f"Device: {device}")
+    print(f"Mode: {run_name}")
+    print(f"Using pretrained: {args.use_pretrained}")
 
     for epoch in range(1, args.epochs + 1):
-        t_loss, t_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        v_loss, v_acc = evaluate(model, val_loader, criterion, device)
-
-        history["train_loss"].append(t_loss)
-        history["train_acc"].append(t_acc)
-        history["val_loss"].append(v_loss)
-        history["val_acc"].append(v_acc)
-
-        print(
-            f"Epoch [{epoch:>3d}/{args.epochs}]  "
-            f"Train Loss: {t_loss:.4f}  Acc: {t_acc:.4f}  |  "
-            f"Val Loss: {v_loss:.4f}  Acc: {v_acc:.4f}"
+        train_loss, train_acc, train_f1 = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+        val_loss, val_acc, val_f1 = evaluate(
+            model, val_loader, criterion, device
         )
 
-        if v_acc > best_val_acc:
-            best_val_acc = v_acc
-            best_path = os.path.join(args.checkpoint_dir, f"best_classifier_{mode}.pt")
-            torch.save(model.state_dict(), best_path)
+        history["train"].append(
+            {
+                "epoch": epoch,
+                "loss": train_loss,
+                "accuracy": train_acc,
+                "macro_f1": train_f1,
+            }
+        )
+        history["val"].append(
+            {
+                "epoch": epoch,
+                "loss": val_loss,
+                "accuracy": val_acc,
+                "macro_f1": val_f1,
+            }
+        )
 
-    total_time = time.time() - start_time
+        print(
+            f"Epoch [{epoch}/{args.epochs}] | "
+            f"train_loss={train_loss:.4f}, train_acc={train_acc:.4f}, train_f1={train_f1:.4f} | "
+            f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}, val_f1={val_f1:.4f}"
+        )
 
-    # ── Save outputs ──────────────────────────────────────────────
-    curve_path = os.path.join(args.plots_dir, f"finetune_curves_{mode}.png")
-    save_training_curves(history, curve_path, title_prefix=f"Fine-tune ({mode})")
+        metrics = {
+            "train_loss": train_loss,
+            "train_accuracy": train_acc,
+            "train_macro_f1": train_f1,
+            "val_loss": val_loss,
+            "val_accuracy": val_acc,
+            "val_macro_f1": val_f1,
+        }
 
-    metrics = {
-        "mode": mode,
-        "best_val_accuracy": round(best_val_acc, 4),
-        "final_train_accuracy": round(history["train_acc"][-1], 4),
-        "final_val_accuracy": round(history["val_acc"][-1], 4),
-        "epochs": args.epochs,
-        "total_time_seconds": round(total_time, 2),
-        "num_classes": num_classes,
-        "train_samples": len(train_idx),
-        "val_samples": len(val_idx),
-        "freeze_encoder": args.freeze_encoder,
-        "learning_rate": args.lr,
+        save_classifier_checkpoint(
+            checkpoint_dir / f"classifier_{run_name}_latest.pt",
+            epoch,
+            model,
+            optimizer,
+            label_to_index,
+            metrics,
+            args,
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            save_classifier_checkpoint(
+                checkpoint_dir / f"classifier_{run_name}_best.pt",
+                epoch,
+                model,
+                optimizer,
+                label_to_index,
+                metrics,
+                args,
+            )
+
+    test_loss, test_acc, test_f1 = evaluate(model, test_loader, criterion, device)
+
+    final_results = {
+        "run_name": run_name,
+        "test_loss": test_loss,
+        "test_accuracy": test_acc,
+        "test_macro_f1": test_f1,
+        "best_val_macro_f1": best_val_f1,
+        "history": history,
     }
-    metrics_path = os.path.join(args.metrics_dir, f"finetune_{mode}.json")
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"Metrics saved: {metrics_path}")
 
-    print(f"\n✅ Fine-tuning ({mode}) complete — best val accuracy: {best_val_acc:.4f}")
+    save_json(final_results, metrics_dir / f"finetune_{run_name}_metrics.json")
+
+    print(
+        f"Final test [{run_name}] | "
+        f"loss={test_loss:.4f}, accuracy={test_acc:.4f}, macro_f1={test_f1:.4f}"
+    )
 
 
 if __name__ == "__main__":
