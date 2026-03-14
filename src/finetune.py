@@ -62,6 +62,7 @@ def build_loaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        drop_last=len(train_dataset) >= batch_size,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -82,7 +83,7 @@ def build_loaders(
 
 
 def load_encoder_from_pretrained(checkpoint_path: str, device: torch.device) -> ResNet18Encoder:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     encoder = ResNet18Encoder(pretrained=False)
 
@@ -182,6 +183,7 @@ def save_classifier_checkpoint(
             "model_state_dict": model.state_dict(),
             "encoder_state_dict": model.encoder.state_dict(),
             "classifier_state_dict": model.classifier.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
             "label_to_index": label_to_index,
             "metrics": metrics,
             "args": vars(args),
