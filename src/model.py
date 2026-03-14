@@ -2,11 +2,12 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 
 
 class ProjectionHead(nn.Module):
-    def __init__(self, in_dim: int = 512, hidden_dim: int = 256, out_dim: int = 128):
+    def __init__(self, in_dim: int, hidden_dim: int = 256, out_dim: int = 128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -32,7 +33,7 @@ class ResNet18Encoder(nn.Module):
 
 
 class SimCLR(nn.Module):
-    def __init__(self, feature_dim: int = 512, projection_dim: int = 128):
+    def __init__(self, projection_dim: int = 128):
         super().__init__()
         self.encoder = ResNet18Encoder(pretrained=False)
         self.projector = ProjectionHead(
@@ -44,16 +45,15 @@ class SimCLR(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.encoder(x)
         projections = self.projector(features)
-        projections = nn.functional.normalize(projections, dim=1)
+        projections = F.normalize(projections, dim=1)
         return features, projections
 
 
 class LinearClassifier(nn.Module):
-    def __init__(self, encoder: nn.Module, num_classes: int):
+    def __init__(self, encoder: ResNet18Encoder, num_classes: int):
         super().__init__()
         self.encoder = encoder
-        feature_dim = getattr(encoder, "feature_dim", 512)
-        self.classifier = nn.Linear(feature_dim, num_classes)
+        self.classifier = nn.Linear(self.encoder.feature_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         features = self.encoder(x)
