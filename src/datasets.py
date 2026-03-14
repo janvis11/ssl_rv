@@ -52,7 +52,8 @@ class LabeledImageDataset(Dataset):
         transform: Optional[Callable] = None,
         label_to_index: Optional[Dict[str, int]] = None,
     ):
-        self.csv_path = Path(csv_path)
+        self.csv_path = Path(csv_path).resolve()
+        self.root_dir = self.csv_path.parent.parent
         self.transform = transform
         self.data = pd.read_csv(self.csv_path)
 
@@ -78,6 +79,8 @@ class LabeledImageDataset(Dataset):
     def __getitem__(self, index: int) -> Tuple:
         row = self.data.iloc[index]
         image_path = Path(row["image_path"])
+        if not image_path.is_absolute():
+            image_path = self.root_dir / image_path
         label_name = row["label"]
 
         if not image_path.exists():
