@@ -53,7 +53,7 @@ class LabeledImageDataset(Dataset):
         label_to_index: Optional[Dict[str, int]] = None,
     ):
         self.csv_path = Path(csv_path).resolve()
-        self.root_dir = self.csv_path.parent.parent
+        self.root_dir = self.csv_path.parents[2]
         self.transform = transform
         self.data = pd.read_csv(self.csv_path)
 
