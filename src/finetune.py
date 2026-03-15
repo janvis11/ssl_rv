@@ -229,7 +229,15 @@ def main():
 
     model = LinearClassifier(encoder=encoder, num_classes=len(label_to_index)).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = AdamW(model.parameters(), lr=args.lr)
+
+    if args.use_pretrained:
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+        trainable_params = model.classifier.parameters()
+    else:
+        trainable_params = model.parameters()
+
+    optimizer = AdamW(trainable_params, lr=args.lr)
 
     checkpoint_dir = Path(args.output_dir) / "checkpoints"
     metrics_dir = Path(args.output_dir) / "metrics"
