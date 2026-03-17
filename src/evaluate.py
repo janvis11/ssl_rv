@@ -85,7 +85,7 @@ def main():
         "label_mapping": label_to_index,
     }
 
-    output_path = Path(args.output_dir) / "metrics" / "evaluation_results.json"
+    output_path = Path(args.output_dir) / "metrics" / "evaluation_results2.json"   #chnage the name of the file to avoid overwriting previous results
     save_json(results, output_path)
 
     print(f"Accuracy: {acc:.4f}")
