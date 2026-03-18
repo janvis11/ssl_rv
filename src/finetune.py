@@ -227,17 +227,34 @@ def main():
         encoder = ResNet18Encoder(pretrained=False)
         run_name = "scratch"
 
-    model = LinearClassifier(encoder=encoder, num_classes=len(label_to_index)).to(device)
-    criterion = nn.CrossEntropyLoss()
+    model = LinearClassifier(encoder=encoder, num_classes=len(label_to_index), hidden_dim=512, dropout=0.5).to(device)
+    
+    # Compute class weights
+    from collections import Counter
+    train_labels = [label for _, label in train_loader.dataset]
+    class_counts = Counter(train_labels)
+    total_samples = sum(class_counts.values())
+    class_weights = [total_samples / (len(class_counts) * count) for count in [class_counts[i] for i in range(len(label_to_index))]]
+    class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+    
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     if args.use_pretrained:
-        for param in model.encoder.parameters():
-            param.requires_grad = False
-        trainable_params = model.classifier.parameters()
+        # Freeze all encoder layers except the last one (layer4)
+        for name, param in model.encoder.named_parameters():
+            if 'layer4' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        # Use different learning rates
+        encoder_lr = args.lr * 0.1  # Lower LR for encoder
+        classifier_lr = args.lr
+        optimizer = AdamW([
+            {'params': model.encoder.layer4.parameters(), 'lr': encoder_lr},
+            {'params': model.classifier.parameters(), 'lr': classifier_lr}
+        ])
     else:
-        trainable_params = model.parameters()
-
-    optimizer = AdamW(trainable_params, lr=args.lr)
+        optimizer = AdamW(trainable_params, lr=args.lr)
 
     checkpoint_dir = Path(args.output_dir) / "checkpoints"
     metrics_dir = Path(args.output_dir) / "metrics"
