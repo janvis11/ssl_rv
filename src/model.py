@@ -50,10 +50,15 @@ class SimCLR(nn.Module):
 
 
 class LinearClassifier(nn.Module):
-    def __init__(self, encoder: ResNet18Encoder, num_classes: int):
+    def __init__(self, encoder: ResNet18Encoder, num_classes: int, hidden_dim: int = 512, dropout: float = 0.5):
         super().__init__()
         self.encoder = encoder
-        self.classifier = nn.Linear(self.encoder.feature_dim, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.encoder.feature_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         features = self.encoder(x)
