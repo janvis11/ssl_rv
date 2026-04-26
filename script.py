@@ -2,8 +2,8 @@ import random
 import shutil
 from pathlib import Path
 
-source_dir = Path("D:\ssl-robotics-vision\dataset\2011_09_26\2011_09_26_drive_0001_sync\image_00\data")
-target_dir = Path("D:\ssl-robotics-vision\data\unlabeled")
+source_dir = Path("")
+target_dir = Path("")
 num_images = 500
 seed = 42
 
