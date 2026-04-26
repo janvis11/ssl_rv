@@ -70,7 +70,7 @@ ssl-robotics-vision/
 ├── outputs/
 │   ├── checkpoints/             # Saved model weights
 │   ├── plots/                   # Visualization outputs
-│   └── metrics/                # Logged metrics and result summaries
+    └── metrics/                # Logged metrics and result summaries
 ```
 
 
