@@ -71,9 +71,6 @@ ssl-robotics-vision/
 │   ├── checkpoints/             # Saved model weights
 │   ├── plots/                   # Visualization outputs
 │   └── metrics/                # Logged metrics and result summaries
-│
-└── report/
-    └── summary.md               # Short experimental summary
 ```
 
 
